@@ -1,15 +1,40 @@
 'use strict';
 
-const fs_mod            = require('fs').promises;
+require('dotenv').config();
+
+const express           = require('express');
+const fs                = require('fs');
+const fs_mod            = fs.promises;
 const path              = require('path');
+const Bottleneck        = require('bottleneck');
 const { google }        = require('googleapis');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode            = require('qrcode-terminal');
 const QRCode            = require('qrcode');
+const db                = require('./database.js');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const limiter = new Bottleneck({
+  maxConcurrent: 5,
+  minTime: 250, // Max 4 requests per second
+});
 
 const CREDENTIALS_PATH = path.join(__dirname, 'credentials.json');
 const TOKEN_PATH       = path.join(__dirname, 'token.json');
 const QR_IMAGE_PATH    = path.join(__dirname, 'qr.png');
+
+// Load client secrets from a local file.
+const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+const { client_secret, client_id } = credentials.installed || credentials.web;
+
+const REDIRECT_URI = `${process.env.PUBLIC_BASE_URL}/oauth2callback`;
+const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, REDIRECT_URI);
+
+const SCOPES = [
+  'https://www.googleapis.com/auth/classroom.courses.readonly',
+  'https://www.googleapis.com/auth/classroom.coursework.me.readonly',
+];
 
 const IGNORED_CLASSES  = [];
 const DONE_STATES      = new Set(['TURNED_IN', 'RETURNED']);
@@ -33,6 +58,57 @@ async function authorize() {
   oAuth2Client.setCredentials(tok);
   return oAuth2Client;
 }
+
+app.get('/auth', (req, res) => {
+  const phoneNumber = req.query.phone;
+  if (!phoneNumber) {
+    return res.status(400).send('Phone number is required. Please use the link provided by the WhatsApp bot.');
+  }
+
+  const authUrl = oAuth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent', // Force consent to ensure we get a refresh token
+    scope: SCOPES,
+    state: phoneNumber, // Pass the WhatsApp ID through the auth flow
+  });
+
+  res.redirect(authUrl);
+});
+
+app.get('/oauth2callback', async (req, res) => {
+  const code = req.query.code;
+  const whatsappId = req.query.state; // We get the phone number back here!
+
+  if (!code || !whatsappId) {
+    return res.status(400).send('Authentication failed. Missing code or state.');
+  }
+
+  try {
+    const { tokens } = await oAuth2Client.getToken(code);
+
+    // Insert or update the user in the database
+    const stmt = db.prepare(`
+      INSERT INTO users (whatsapp_id, refresh_token, access_token, token_expiry, sync_status)
+      VALUES (?, ?, ?, ?, 'active')
+      ON CONFLICT(whatsapp_id) DO UPDATE SET
+        refresh_token = excluded.refresh_token,
+        access_token = excluded.access_token,
+        token_expiry = excluded.token_expiry,
+        sync_status = 'active'
+    `);
+
+    // If the user already authorized before, Google might not send a new refresh token.
+    // We only update it if it exists in the new token payload.
+    const refreshTokenToSave = tokens.refresh_token || null;
+
+    stmt.run(whatsappId, refreshTokenToSave, tokens.access_token, tokens.expiry_date);
+
+    res.send('<h1>Authentication Successful!</h1><p>Your Google Classroom is now linked. You can close this window and return to WhatsApp.</p>');
+  } catch (error) {
+    console.error('Error retrieving access token', error);
+    res.status(500).send('Failed to authenticate with Google.');
+  }
+});
 
 function buildDueDeadline(dueDate) {
   return new Date(dueDate.year, dueDate.month - 1, dueDate.day, 23, 59, 59, 999);
@@ -70,7 +146,8 @@ function formatAssignmentMsg(work) {
   );
 }
 
-async function getPendingAssignments(classroom) {
+async function getPendingAssignments(auth) {
+  const classroom = google.classroom({ version: 'v1', auth });
   const ignoredSet = new Set(IGNORED_CLASSES.map(n => n.trim().toLowerCase()));
   const now = new Date();
   const coursesRes = await classroom.courses.list({ courseStates: ['ACTIVE'] });
@@ -134,6 +211,7 @@ async function getPendingAssignments(classroom) {
       results.push({
         courseName:      courseName,
         assignmentTitle: title,
+        title:          title,
         dueDate:  work.dueDate  ?? null,
         dueTime:  work.dueTime  ?? null,
         url:      work.alternateLink ?? `https://classroom.google.com/c/${course.id}`,
@@ -147,14 +225,17 @@ async function getPendingAssignments(classroom) {
 
 // -- WhatsApp client ------------------------------------------------------------
 const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+  authStrategy: new LocalAuth({ dataPath: './.wwebjs_cache' }),
+  puppeteer: {
+    executablePath: '/usr/bin/chromium-browser',
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  },
 });
 
 let seenAssignmentIds    = new Set();
 let alarmedAssignmentIds = new Set();
 let myWhatsAppNumber     = null;
-let classroomClient      = null;
+let defaultAuthClient    = null;
 
 client.on('qr', async qr => {
   console.log('\n==================================================');
@@ -189,8 +270,8 @@ client.on('ready', async () => {
   } catch (_) {}
 
   try {
-    const auth      = await authorize();
-    classroomClient = google.classroom({ version: 'v1', auth });
+    const auth = await authorize();
+    defaultAuthClient = auth;
     myWhatsAppNumber = client.info.wid._serialized;
     console.log('? Google Classroom authenticated.');
     console.log(`?? Bot number: ${myWhatsAppNumber}`);
@@ -204,9 +285,9 @@ client.on('ready', async () => {
 });
 
 async function checkAndNotifyAssignments() {
-  if (!classroomClient || !myWhatsAppNumber) return;
+  if (!defaultAuthClient || !myWhatsAppNumber) return;
   try {
-    const pendingWork = await getPendingAssignments(classroomClient);
+    const pendingWork = await getPendingAssignments(defaultAuthClient);
     if (!pendingWork || pendingWork.length === 0) return;
 
     for (const work of pendingWork) {
@@ -234,33 +315,74 @@ async function checkAndNotifyAssignments() {
   }
 }
 
-client.on('message_create', async msg => {
-  if (!msg.fromMe) return;
-  const body = msg.body.trim().toLowerCase();
+async function getUserOAuthClient(whatsappId) {
+  const user = db.prepare('SELECT * FROM users WHERE whatsapp_id = ?').get(whatsappId);
+  if (!user || !user.refresh_token) return null;
 
-  if (body === '!myclass') {
-    console.log('[Bot] !myclass command received');
+  const client = new google.auth.OAuth2(client_id, client_secret, REDIRECT_URI);
+  client.setCredentials({
+    access_token: user.access_token,
+    refresh_token: user.refresh_token,
+    expiry_date: user.token_expiry,
+  });
+
+  // Automatically save new tokens if Google refreshes them
+  client.on('tokens', tokens => {
+    db.prepare(`
+      UPDATE users SET
+      access_token = COALESCE(?, access_token),
+      refresh_token = COALESCE(?, refresh_token),
+      token_expiry = COALESCE(?, token_expiry)
+      WHERE whatsapp_id = ?
+    `).run(tokens.access_token, tokens.refresh_token, tokens.expiry_date, whatsappId);
+  });
+
+  return client;
+}
+
+client.on('message_create', async message => {
+  const text = message.body.trim().toLowerCase();
+  const userId = message.from;
+
+  if (text === '!ping') {
+    return message.reply('pong!');
+  }
+
+  if (text === '!register') {
+    const authLink = `${process.env.PUBLIC_BASE_URL}/auth?phone=${userId}`;
+    return message.reply(`Welcome! To connect your Google Classroom, click this secure link:\n\n${authLink}\n\nAfter logging in, return here and type !myclass`);
+  }
+
+  if (text === '!myclass') {
     try {
-      await msg.reply('Fetching your pending assignments...');
-      const pendingWork = await getPendingAssignments(classroomClient);
-
-      if (!pendingWork || pendingWork.length === 0) {
-        await msg.reply('You are all caught up! No pending assignments.');
-        return;
+      const userAuth = await getUserOAuthClient(userId);
+      if (!userAuth) {
+        return message.reply('You are not registered yet! Please send !register to link your account.');
       }
 
-      let message = '?? *PENDING ASSIGNMENTS:*\n\n';
-      pendingWork.forEach((work, index) => {
-        message += `${index + 1}. ${formatAssignmentMsg(work)}\n\n`;
+      message.reply('Fetching your assignments... Please wait.');
+
+      // Wrap the existing Classroom API call inside the rate limiter
+      const assignments = await limiter.schedule(() => getPendingAssignments(userAuth));
+
+      if (!assignments || assignments.length === 0) {
+        return message.reply('You have no pending assignments! 🎉');
+      }
+
+      let replyText = '📚 *Your Pending Assignments:*\n\n';
+      assignments.forEach(task => {
+        replyText += `🔹 *${task.courseName || 'Class'}*\n📌 ${task.title}\n⏰ Due: ${task.due || 'No due date'}\n🔗 ${task.url}\n\n`;
       });
-      await msg.reply(message);
-      console.log('Assignment list sent via !myclass command');
+      return message.reply(replyText);
     } catch (error) {
-      console.error('Error handling !myclass command:', error);
-      await msg.reply('Error fetching assignments. Please try again later.');
+      console.error('Error fetching classes for user', userId, error);
+      return message.reply('Failed to fetch your classes. Your session might have expired. Try !register again.');
     }
   }
 });
 
 console.log('Initializing WhatsApp Bot... Please wait.');
 client.initialize();
+app.listen(PORT, () => {
+  console.log(`Auth Gateway running on port ${PORT}`);
+});
