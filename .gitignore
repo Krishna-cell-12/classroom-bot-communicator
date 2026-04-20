@@ -1,0 +1,23 @@
+# -- Dependencies ----------------------------------
+node_modules/
+
+# -- WhatsApp session & cache (never commit these) -
+.wwebjs_auth/
+.wwebjs_cache/
+
+# -- Secrets (NEVER commit) ------------------------
+credentials.json
+token.json
+.env
+*.env
+
+# -- Generated files -------------------------------
+qr.png
+logs/
+*.log
+
+# -- OS / Editor -----------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
