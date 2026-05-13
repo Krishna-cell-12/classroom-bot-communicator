@@ -21,3 +21,7 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
+node_modules/
+.env
+baileys_auth.db/
+baileys_auth.db-journal
